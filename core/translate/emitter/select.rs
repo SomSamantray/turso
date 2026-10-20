@@ -213,6 +213,15 @@ pub fn emit_query<'a>(
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
 
+    for aggregate in &mut plan.aggregates {
+        crate::translate::aggregation::init_aggregate_order(
+            program,
+            &plan.table_references,
+            &t_ctx.resolver,
+            aggregate,
+        )?;
+    }
+
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
     // e.g. SELECT COUNT(*) WHERE 0 returns a row with 0, not an empty result set.

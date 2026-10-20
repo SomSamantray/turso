@@ -585,9 +585,9 @@ pub fn resolve_window_and_aggregate_functions(
                     );
                 }
 
-                if !order_by.is_empty() {
+                if !order_by.is_empty() && filter_over.over_clause.is_some() {
                     crate::bail_parse_error!(
-                        "ORDER BY clause is not supported yet in aggregate functions"
+                        "ORDER BY may not be used with non-aggregate functions"
                     );
                 }
                 let args_count = args.len();
@@ -670,6 +670,11 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                     }
                     _ => {}
+                }
+                if !order_by.is_empty() {
+                    crate::bail_parse_error!(
+                        "ORDER BY may not be used with non-aggregate functions"
+                    );
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
