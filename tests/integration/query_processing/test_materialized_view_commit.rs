@@ -452,74 +452,50 @@ fn count_orders(conn: &std::sync::Arc<turso_core::Connection>) -> i64 {
     }
 }
 
-/// A COMMIT that fails partway through must leave no partial effects behind,
-/// even when a materialized view is maintained on the table being written.
-/// The repro drives enough INSERT OR REPLACE batches that some COMMIT in the
-/// run hits an induced failure; once that happens, the row count on the same
-/// connection and on a fresh connection must agree with the number of batches
-/// that actually reported success.
-#[turso_macros::test(views)]
-fn failed_commit_with_materialized_view_leaves_no_rows_behind(
-    tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute(
-        "CREATE TABLE orders (collection TEXT NOT NULL, key TEXT NOT NULL, \
-         value TEXT NOT NULL, PRIMARY KEY (collection, key))",
-    )
-    .unwrap();
-    conn.execute(
-        "CREATE MATERIALIZED VIEW mv AS SELECT json_extract(value,'$.customer') AS grp, \
-         SUM(json_extract(value,'$.amount')) AS agg FROM orders \
-         WHERE collection='o' GROUP BY grp",
-    )
-    .unwrap();
+#[test]
+fn failed_commit_with_materialized_view_leaves_no_rows_behind() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+    use std::sync::Arc;
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect};
 
-    let mut committed = 0i64;
-    let mut commit_error = None;
-    for start in (0..10_000).step_by(1000) {
-        conn.execute("BEGIN").unwrap();
-        for i in start..start + 1000 {
-            let key = format!("order-{i:05}");
-            let value = format!(
-                r#"{{"customer":"c{}","amount":{}}}"#,
-                i % 316,
-                (i % 97) as f64 + 0.5
-            );
-            let mut stmt = conn
-                .prepare(
-                    "INSERT OR REPLACE INTO orders (collection, key, value) VALUES ('o', ?, ?)",
-                )
-                .unwrap();
-            stmt.bind_at(1.try_into().unwrap(), turso_core::Value::build_text(key))
-                .unwrap();
-            stmt.bind_at(2.try_into().unwrap(), turso_core::Value::build_text(value))
-                .unwrap();
-            stmt.run_ignore_rows().unwrap();
-        }
-        match conn.execute("COMMIT") {
-            Ok(()) => committed += 1000,
-            Err(e) => {
-                commit_error = Some(e.to_string());
-                break;
-            }
-        }
-    }
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        "materialized-view-commit-fault.db",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_views(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect(ConnectOpts::new())?;
+    conn.execute("CREATE TABLE orders (collection TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (collection, key))")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT json_extract(value,'$.customer') AS grp, SUM(json_extract(value,'$.amount')) AS agg FROM orders WHERE collection='o' GROUP BY grp")?;
+    conn.execute(r#"INSERT INTO orders VALUES ('o', 'k0', '{"customer":"c0","amount":1}')"#)?;
+    conn.execute("BEGIN")?;
+    conn.execute(r#"INSERT OR REPLACE INTO orders VALUES ('o', 'k0', '{"customer":"c0","amount":5}'), ('o', 'k1', '{"customer":"c1","amount":7}')"#)?;
 
-    let Some(commit_error) = commit_error else {
-        return Ok(());
-    };
-
-    let same_conn_rows = count_orders(&conn);
-    let fresh = tmp_db.connect_limbo();
-    let fresh_rows = count_orders(&fresh);
-    assert_eq!(
-        (same_conn_rows, fresh_rows),
-        (committed, committed),
-        "rows from the transaction whose COMMIT failed ({commit_error}) are still visible \
-         (same connection, fresh connection)"
+    io.fault_after(
+        "materialized-view-commit-fault.db-wal",
+        QueuedIoOpKind::Pwritev,
+        0,
     );
-
+    let commit_error = conn
+        .execute("COMMIT")
+        .expect_err("COMMIT must fail at the injected WAL write");
+    io.clear_fault();
+    let fresh = db.connect(ConnectOpts::new())?;
+    assert_eq!(
+        (count_orders(&conn), count_orders(&fresh)),
+        (1, 1),
+        "{commit_error}"
+    );
+    for connection in [&conn, &fresh] {
+        let rows: Vec<(String, i64)> = connection.exec_rows("SELECT grp, agg FROM mv ORDER BY grp");
+        assert_eq!(rows, vec![("c0".to_string(), 1)]);
+        let amounts: Vec<(i64,)> =
+            connection.exec_rows("SELECT json_extract(value, '$.amount') FROM orders");
+        assert_eq!(amounts, vec![(1,)]);
+    }
     Ok(())
 }
 
