@@ -601,6 +601,12 @@ impl Statement {
                     .n_active_blob_statements
                     .fetch_sub(1, Ordering::SeqCst);
             }
+            if self.program.connection.get_auto_commit() {
+                self.program
+                    .connection
+                    .ended_transaction_count
+                    .fetch_add(1, Ordering::SeqCst);
+            }
             let previous = self
                 .program
                 .connection

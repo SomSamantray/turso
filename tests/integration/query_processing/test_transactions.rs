@@ -2416,3 +2416,45 @@ fn test_begin_immediate_lazily_created_temp_follows_transaction(tmp_db: TempData
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM tt");
     assert_eq!(rows, vec![(1,)]);
 }
+
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY);")]
+fn test_ended_transaction_count(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let other = tmp_db.connect_limbo();
+    let never_run = conn.prepare("SELECT 1").unwrap();
+    assert_eq!(conn.ended_transaction_count(), 0);
+
+    conn.execute("SELECT 1").unwrap();
+    assert_eq!(conn.ended_transaction_count(), 1);
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert!(matches!(
+        conn.execute("INSERT INTO t VALUES (1)"),
+        Err(LimboError::Constraint(_))
+    ));
+    assert!(!conn.get_auto_commit());
+    assert_eq!(conn.ended_transaction_count(), 1);
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(conn.ended_transaction_count(), 2);
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(conn.ended_transaction_count(), 3);
+
+    let mut rows = conn.prepare("SELECT id FROM t").unwrap();
+    assert!(matches!(rows.step().unwrap(), StepResult::Row));
+    assert_eq!(conn.ended_transaction_count(), 3);
+    rows.reset().unwrap();
+    assert_eq!(conn.ended_transaction_count(), 4);
+
+    assert!(matches!(
+        conn.execute("INSERT INTO t VALUES (1)"),
+        Err(LimboError::Constraint(_))
+    ));
+    assert_eq!(conn.ended_transaction_count(), 5);
+
+    other.execute("SELECT 1").unwrap();
+    drop(never_run);
+    assert_eq!(conn.ended_transaction_count(), 5);
+}

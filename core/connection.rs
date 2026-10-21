@@ -508,6 +508,7 @@ pub struct Connection {
     /// handles; a handle re-positions on its next blob operation after the
     /// checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
+    pub(crate) ended_transaction_count: AtomicU64,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
@@ -2787,6 +2788,10 @@ impl Connection {
 
     pub fn get_auto_commit(&self) -> bool {
         self.auto_commit.load(Ordering::SeqCst)
+    }
+
+    pub fn ended_transaction_count(&self) -> u64 {
+        self.ended_transaction_count.load(Ordering::SeqCst)
     }
 
     /// Mark the active explicit transaction poisoned so COMMIT rolls it back.
