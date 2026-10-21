@@ -3740,3 +3740,55 @@ fn test_postgres_catalog_conkey_any_matches_no_rows(db: TempDatabase) {
     let rows = stmt.run_collect_rows().unwrap();
     assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_show_search_path_reads_the_setting_when_executed(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let mut show = conn.prepare("SHOW search_path").unwrap();
+    assert_eq!(show.num_columns(), 1);
+    assert_eq!(show.get_column_name(0), "search_path");
+    assert_eq!(
+        show.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("\"$user\", public")]]
+    );
+    conn.execute("SET search_path TO public, pg_catalog")
+        .unwrap();
+    show.reset().unwrap();
+    assert_eq!(
+        show.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("public, pg_catalog")]]
+    );
+    assert_eq!(
+        conn.prepare("SHOW SEARCH_PATH")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("public, pg_catalog")]]
+    );
+}
+
+#[turso_macros::test]
+fn test_postgres_prepared_statement_keeps_search_path_after_schema_change(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE demo (label text)").unwrap();
+    conn.execute("INSERT INTO demo VALUES ('from public')")
+        .unwrap();
+    conn.execute("CREATE SCHEMA sp").unwrap();
+    conn.execute("CREATE TABLE sp.demo (label text)").unwrap();
+    conn.execute("INSERT INTO sp.demo VALUES ('from sp')")
+        .unwrap();
+    conn.execute("SET search_path TO sp").unwrap();
+
+    let mut stmt = conn.prepare("SELECT label FROM demo").unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("from sp")]]
+    );
+
+    conn.execute("CREATE TABLE sp.other (x int)").unwrap();
+    stmt.reset().unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("from sp")]]
+    );
+}
