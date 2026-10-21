@@ -617,7 +617,7 @@ fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprTy
     if let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) {
         // Domains are transparent wrappers — resolve to the base primitive type
         // so CHECK constraint type checking compares primitives, not domain names.
-        if resolved.is_domain() {
+        if resolved.is_domain() || resolved.reads_stored_values_unchanged() {
             return resolve_type_name(&resolved.primitive, resolver);
         }
         return Ok(CheckExprType::CustomType(type_name.to_lowercase()));
@@ -1888,10 +1888,19 @@ pub fn translate_drop_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts::new(4, 40, 4);
     program.extend(&opts);
+
+    let Some(database_id) = resolver.find_existing_table_database_id_qualified(&tbl_name)? else {
+        if if_exists {
+            return Ok(());
+        }
+        bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(&tbl_name)
+        );
+    };
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

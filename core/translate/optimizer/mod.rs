@@ -14,7 +14,7 @@ use crate::schema::GeneratedType;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
-    function::{AggFunc, Deterministic},
+    function::{AggFunc, Deterministic, Func},
     index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
@@ -1426,12 +1426,17 @@ fn update_write_set_reason(
             .iter()
             .map(|set_clause| set_clause.column_index)
             .try_collect()?;
+        let updated_col_names: Vec<_> = plan
+            .set_clauses
+            .iter()
+            .flat_map(|set_clause| set_clause.column_names.iter().cloned())
+            .try_collect()?;
         let database_id = table_ref.database_id;
         if has_triggers_including_temp(
             resolver,
             database_id,
             TriggerEvent::Update,
-            Some(&updated_cols),
+            Some(&updated_col_names),
             btree_table,
         ) {
             break 'requires Some(DmlSafetyReason::Trigger);
@@ -4106,7 +4111,12 @@ impl Optimizable for ast::Expr {
                 else {
                     return false;
                 };
-                func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
+                // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and time
+                // functions return the same value for the whole statement, so they
+                // can be computed once instead of on every row.
+                let same_for_whole_statement = func.is_deterministic()
+                    || matches!(func, Func::Scalar(f) if f.is_date_time_function());
+                same_for_whole_statement && args.iter().all(|arg| arg.is_constant(resolver))
             }
             Expr::FunctionCallStar { .. } => false,
             // A merged USING column reads table columns, so its value changes from row to row.

@@ -1,5 +1,6 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use rustc_hash::FxHashMap as HashMap;
+use std::borrow::Cow;
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -11,8 +12,8 @@ use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgShowStmt,
-    PostgreSQLTranslator,
+    unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PgSetStmt, PgShowStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -259,27 +260,35 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         return Ok(stmt);
     }
 
+    let search_path = pg_conn
+        .conn
+        .context::<PgSessionState>()
+        .expect("PostgreSQL connections have session state")
+        .lock()
+        .unwrap()
+        .search_path
+        .current(&pg_conn.conn)
+        .map(|search_path| search_path.schemas.clone());
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let (sql, parse_result) =
+        match create_table_schema_from_search_path(pg_conn, &parse_result, &search_path)? {
+            Some((location, schema)) => {
+                let sql = turso_pg_parser::qualify_create_table_name(sql, location, &schema);
+                let parse_result = turso_pg_parser::parse(&sql)
+                    .map_err(|e| LimboError::ParseError(e.to_string()))?;
+                (Cow::Owned(sql), parse_result)
+            }
+            None => (Cow::Borrowed(sql), parse_result),
+        };
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
 
-    let options = {
-        let state = pg_conn
-            .conn
-            .context::<PgSessionState>()
-            .expect("PostgreSQL connections have session state")
-            .lock()
-            .unwrap();
-        PrepareOptions {
-            unqualified_database_search_path: state
-                .search_path
-                .current(&pg_conn.conn)
-                .map(|search_path| search_path.schemas.clone()),
-        }
+    let options = PrepareOptions {
+        unqualified_database_search_path: search_path,
     };
     for prereq in translated.prereqs {
         let input = prereq.to_string();
@@ -291,7 +300,53 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
 
     pg_conn
         .conn
-        .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+        .prepare_translated_cmd_with_options(translated.cmd, &sql, &options)
+}
+
+/// The schema that a CREATE TABLE statement naming its table without a
+/// schema creates the table in, with the byte offset of the table name: the
+/// first schema of `search_path` that exists, like PostgreSQL. None when the
+/// statement is not such a CREATE TABLE, when `search_path` is not set, or
+/// when the table goes to public, which is where core puts it anyway.
+fn create_table_schema_from_search_path(
+    pg_conn: &Arc<PgConnectionInner>,
+    parse_result: &turso_pg_parser::ParseResult,
+    search_path: &Option<Vec<String>>,
+) -> Result<Option<(usize, String)>> {
+    let Some(location) = unqualified_create_table_name_location(parse_result) else {
+        return Ok(None);
+    };
+    if search_path.is_none() {
+        return Ok(None);
+    }
+    let schema = current_schema(&pg_conn.conn).ok_or_else(|| {
+        LimboError::ParseError("no schema has been selected to create in".to_string())
+    })?;
+    if schema.eq_ignore_ascii_case("public") {
+        return Ok(None);
+    }
+    Ok(Some((location, schema)))
+}
+
+/// The first schema of `search_path` that exists, which is what PostgreSQL's
+/// current_schema() returns. None when no schema of `search_path` exists.
+/// The default search_path, "$user", public, gives public, since there is no
+/// schema named after a user.
+pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
+    let Some(search_path) = conn.context::<PgSessionState>().and_then(|state| {
+        state
+            .lock()
+            .unwrap()
+            .search_path
+            .current(conn)
+            .map(|search_path| search_path.schemas.clone())
+    }) else {
+        return Some("public".to_owned());
+    };
+    let attached = conn.attached_database_names();
+    search_path
+        .into_iter()
+        .find(|schema| schema.eq_ignore_ascii_case("public") || attached.contains(schema))
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {

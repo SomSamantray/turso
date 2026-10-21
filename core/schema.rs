@@ -259,6 +259,12 @@ impl ResolvedType {
         self.chain[0].is_domain
     }
 
+    pub fn reads_stored_values_unchanged(&self) -> bool {
+        self.chain.iter().all(|td| {
+            matches!(td.kind, TypeDefKind::Custom { .. }) && td.decode_returns_value_unchanged()
+        })
+    }
+
     /// Find the first DEFAULT expression in the type chain (child first, then ancestors).
     /// Matches PostgreSQL: a child domain inherits the parent's DEFAULT when it
     /// doesn't declare its own.
@@ -4024,7 +4030,7 @@ impl BTreeTable {
             }
 
             if column.notnull()
-                && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
+                && (column.explicit_notnull() || !self.primary_key_implies_not_null(column))
             {
                 sql.push_str(" NOT NULL");
                 push_on_conflict_clause(&mut sql, column.notnull_conflict_clause);
@@ -4236,8 +4242,9 @@ impl BTreeTable {
             .and_then(|column| column.collation)
     }
 
-    fn is_without_rowid_inline_pk(&self, column: &Column) -> bool {
-        !self.has_rowid && self.primary_key_columns.len() == 1 && column.primary_key()
+    fn primary_key_implies_not_null(&self, column: &Column) -> bool {
+        column.primary_key()
+            && (self.is_strict || (!self.has_rowid && self.primary_key_columns.len() == 1))
     }
 
     pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
@@ -4775,15 +4782,9 @@ pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) ->
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
     match func {
-        Func::Scalar(
-            ScalarFunc::Date
-            | ScalarFunc::Time
-            | ScalarFunc::DateTime
-            | ScalarFunc::UnixEpoch
-            | ScalarFunc::JulianDay
-            | ScalarFunc::StrfTime
-            | ScalarFunc::TimeDiff,
-        ) => is_deterministic_datetime_call(func, args),
+        Func::Scalar(scalar_func) if scalar_func.is_date_time_function() => {
+            is_deterministic_datetime_call(func, args)
+        }
         _ => func.is_deterministic(),
     }
 }
@@ -5588,6 +5589,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         column_dependencies: Default::default(),
     };
     table.prepare_generated_columns()?;
+    if table.is_strict {
+        for column in table.columns.iter_mut() {
+            if column.primary_key() && !column.is_rowid_alias() {
+                column.set_notnull(true);
+            }
+        }
+    }
     if !table.has_rowid {
         if table.primary_key_columns.is_empty() {
             crate::bail_parse_error!("PRIMARY KEY missing on table {}", table.name);
