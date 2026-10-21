@@ -87,7 +87,10 @@ forms), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
 is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
 Configuration settings functions: `set_config()` and `current_setting()`,
-for `search_path` only.
+for `search_path` only. A value that `set_config()` sets with
+`is_local = true` ends with the transaction. ROLLBACK does not undo the other
+setting changes of the transaction, and ROLLBACK TO SAVEPOINT does not end a
+local value.
 
 | Feature | Status | Notes |
 |---------|--------|-------|

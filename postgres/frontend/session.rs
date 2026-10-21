@@ -25,11 +25,67 @@ struct PgConnectionInner {
 
 #[derive(Default)]
 struct SessionState {
-    search_path: Option<Vec<String>>,
-    search_path_setting: Option<String>,
+    search_path: Setting<SearchPath>,
 }
 
 type PgSessionState = Mutex<SessionState>;
+
+struct SearchPath {
+    setting: String,
+    schemas: Vec<String>,
+}
+
+pub(crate) enum SettingScope {
+    Session,
+    Transaction,
+}
+
+struct Setting<T> {
+    session_value: Option<T>,
+    transaction_value: Option<TransactionValue<T>>,
+}
+
+struct TransactionValue<T> {
+    value: Option<T>,
+    ended_transaction_count: u64,
+}
+
+impl<T> Default for Setting<T> {
+    fn default() -> Self {
+        Self {
+            session_value: None,
+            transaction_value: None,
+        }
+    }
+}
+
+impl<T> Setting<T> {
+    fn set(&mut self, conn: &Connection, value: Option<T>, scope: SettingScope) {
+        match scope {
+            SettingScope::Session => {
+                self.session_value = value;
+                self.transaction_value = None;
+            }
+            SettingScope::Transaction => {
+                self.transaction_value = Some(TransactionValue {
+                    value,
+                    ended_transaction_count: conn.ended_transaction_count(),
+                });
+            }
+        }
+    }
+
+    fn current(&self, conn: &Connection) -> Option<&T> {
+        match &self.transaction_value {
+            Some(transaction_value)
+                if transaction_value.ended_transaction_count == conn.ended_transaction_count() =>
+            {
+                transaction_value.value.as_ref()
+            }
+            _ => self.session_value.as_ref(),
+        }
+    }
+}
 
 pub(crate) const DEFAULT_SEARCH_PATH: &str = "\"$user\", public";
 
@@ -191,7 +247,10 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
             .lock()
             .unwrap();
         PrepareOptions {
-            unqualified_database_search_path: state.search_path.clone(),
+            unqualified_database_search_path: state
+                .search_path
+                .current(&pg_conn.conn)
+                .map(|search_path| search_path.schemas.clone()),
         }
     };
     for prereq in translated.prereqs {
@@ -331,22 +390,41 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     pg_conn.conn.prepare(&pragma_sql)
 }
 
-pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<Value> {
-    let path = value.map(parse_search_path).transpose()?;
-    let state = conn.context::<PgSessionState>().ok_or_else(|| {
-        LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
-    })?;
-    let mut state = state.lock().unwrap();
-    state.search_path = path;
-    state.search_path_setting = value.map(str::to_owned);
+pub(crate) fn set_search_path(
+    conn: &Connection,
+    value: Option<&str>,
+    scope: SettingScope,
+) -> Result<Value> {
+    let search_path = value
+        .map(|setting| {
+            parse_search_path(setting).map(|schemas| SearchPath {
+                setting: setting.to_owned(),
+                schemas,
+            })
+        })
+        .transpose()?;
+    session_state(conn)?
+        .lock()
+        .unwrap()
+        .search_path
+        .set(conn, search_path, scope);
     Ok(Value::build_text(
         value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned(),
     ))
 }
 
 pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {
-    conn.context::<PgSessionState>()
-        .and_then(|state| state.lock().unwrap().search_path_setting.clone())
+    let state = conn.context::<PgSessionState>()?.lock().unwrap();
+    state
+        .search_path
+        .current(conn)
+        .map(|search_path| search_path.setting.clone())
+}
+
+fn session_state(conn: &Connection) -> Result<&PgSessionState> {
+    conn.context::<PgSessionState>().ok_or_else(|| {
+        LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
+    })
 }
 
 fn parse_search_path(value: &str) -> Result<Vec<String>> {

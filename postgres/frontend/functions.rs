@@ -1,3 +1,4 @@
+use crate::session::SettingScope;
 use chrono::Utc;
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
@@ -355,11 +356,11 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             ));
         }
     };
-    let is_local = match args[2].get_value() {
-        Value::Null => false,
+    let scope = match args[2].get_value() {
+        Value::Null => SettingScope::Session,
         value => match value.as_int() {
-            Some(0) => false,
-            Some(1) => true,
+            Some(0) => SettingScope::Session,
+            Some(1) => SettingScope::Transaction,
             _ => {
                 return Err(LimboError::InvalidArgument(
                     "set_config requires a boolean".to_string(),
@@ -367,13 +368,8 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             }
         },
     };
-    if is_local {
-        return Err(LimboError::InvalidArgument(
-            "transaction-local settings are not supported".to_string(),
-        ));
-    }
     match parameter {
-        ConfigParameter::SearchPath => crate::session::set_search_path(conn, value),
+        ConfigParameter::SearchPath => crate::session::set_search_path(conn, value, scope),
     }
 }
 

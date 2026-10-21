@@ -183,14 +183,6 @@ fn test_pg_set_config_validates_arguments(db: TempDatabase) {
             "set_config requires a boolean",
         ),
         (
-            "SELECT set_config('search_path', '', true)",
-            "transaction-local settings are not supported",
-        ),
-        (
-            "SET LOCAL search_path TO missing",
-            "transaction-local settings are not supported",
-        ),
-        (
             "SELECT set_config('search_path', 'public,', false)",
             "invalid value for parameter",
         ),
@@ -256,6 +248,39 @@ fn test_pg_current_setting_reports_default_without_session_state(db: TempDatabas
             .run_collect_rows()
             .unwrap(),
         vec![vec![Value::build_text("\"$user\", public")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_local_search_path_ends_with_the_transaction(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE config_items (v INT)").unwrap();
+    conn.execute("INSERT INTO config_items VALUES (17)")
+        .unwrap();
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('search_path', 'missing', true)"),
+        ["missing"]
+    );
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SET LOCAL search_path TO missing").unwrap();
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT setting FROM pg_settings WHERE name = 'search_path'"
+        ),
+        ["missing"]
+    );
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT setting FROM pg_settings WHERE name = 'search_path'"
+        ),
+        ["\"$user\", public"]
     );
 }
 
