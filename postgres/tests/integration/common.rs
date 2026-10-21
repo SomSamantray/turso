@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use turso_core::{Clock, ConnectOpts, Database, IO};
-use turso_pg::Connection;
+use turso_pg::{Connection, PgConnectOpts};
 
 /// Temp directories holding test databases, deleted when the test process exits.
 ///
@@ -218,5 +218,10 @@ impl TempDatabase {
 
     pub fn connect_postgres(&self) -> Connection {
         Connection::connect(&self.db).unwrap()
+    }
+
+    pub fn connect_postgres_with_custom_parameters(&self) -> Connection {
+        Connection::connect_with_opts(&self.db, PgConnectOpts::new().with_custom_parameters(true))
+            .unwrap()
     }
 }

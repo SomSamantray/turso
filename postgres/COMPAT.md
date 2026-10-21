@@ -87,10 +87,10 @@ forms), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
 is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
 Configuration settings functions: `set_config()` and `current_setting()`,
-for `search_path` only. A value that `set_config()` sets with
-`is_local = true` ends with the transaction. ROLLBACK does not undo the other
-setting changes of the transaction, and ROLLBACK TO SAVEPOINT does not end a
-local value.
+for `search_path` and for custom parameters (see Configuration Management).
+A value that `set_config()` sets with `is_local = true` ends with the
+transaction. ROLLBACK does not undo the other setting changes of the
+transaction, and ROLLBACK TO SAVEPOINT does not end a local value.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -359,6 +359,7 @@ Upgrade is not supported.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | SET / SHOW configuration parameters | 🟡 Partial | Passed through as PRAGMAs; PostgreSQL GUCs other than search_path are not recognized |
+| Custom configuration parameters (`app.user_id`) | 🟡 Partial | Experimental: start tursopg with `--experimental-custom-parameters`; `set_config()` and `current_setting()` only, not SET or SHOW; in server mode, all clients share the values |
 | ALTER SYSTEM | ❌ Not supported | |
 | Fractional input for "integer" values | ❌ Not supported | |
 | Include directives for pg_hba.conf and pg_ident.conf | ❌ Not supported | |

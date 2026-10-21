@@ -330,6 +330,11 @@ enum ConfigParameter {
     SearchPath,
 }
 
+enum Parameter<'a> {
+    BuiltIn(ConfigParameter),
+    Custom(&'a str),
+}
+
 fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
     let name = match args[0].get_value() {
         Value::Text(name) => name.as_str(),
@@ -344,7 +349,7 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             ));
         }
     };
-    let parameter = name.parse::<ConfigParameter>().map_err(|_| {
+    let parameter = find_parameter(name).ok_or_else(|| {
         LimboError::InvalidArgument(format!("unrecognized configuration parameter \"{name}\""))
     })?;
     let value = match args[1].get_value() {
@@ -369,7 +374,10 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
         },
     };
     match parameter {
-        ConfigParameter::SearchPath => crate::session::set_search_path(conn, value, scope),
+        Parameter::BuiltIn(ConfigParameter::SearchPath) => {
+            crate::session::set_search_path(conn, value, scope)
+        }
+        Parameter::Custom(name) => crate::session::set_custom_parameter(conn, name, value, scope),
     }
 }
 
@@ -398,15 +406,28 @@ fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Value> {
             }
         },
     };
-    match name.parse::<ConfigParameter>() {
-        Ok(ConfigParameter::SearchPath) => Ok(Value::build_text(
+    let setting = match find_parameter(name) {
+        Some(Parameter::BuiltIn(ConfigParameter::SearchPath)) => Some(
             crate::session::search_path_setting(conn)
                 .unwrap_or_else(|| crate::session::DEFAULT_SEARCH_PATH.to_owned()),
-        )),
-        Err(_) if missing_ok => Ok(Value::Null),
-        Err(_) => Err(LimboError::InvalidArgument(format!(
+        ),
+        Some(Parameter::Custom(name)) => crate::session::custom_parameter(conn, name),
+        None => None,
+    };
+    match setting {
+        Some(setting) => Ok(Value::build_text(setting)),
+        None if missing_ok => Ok(Value::Null),
+        None => Err(LimboError::InvalidArgument(format!(
             "unrecognized configuration parameter \"{name}\""
         ))),
+    }
+}
+
+fn find_parameter(name: &str) -> Option<Parameter<'_>> {
+    match name.parse::<ConfigParameter>() {
+        Ok(parameter) => Some(Parameter::BuiltIn(parameter)),
+        Err(_) if name.contains('.') => Some(Parameter::Custom(name)),
+        Err(_) => None,
     }
 }
 

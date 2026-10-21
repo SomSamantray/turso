@@ -1,4 +1,5 @@
 use chumsky::{error::EmptyErr, prelude::*};
+use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -23,9 +24,27 @@ struct PgConnectionInner {
     conn: Arc<Connection>,
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct PgConnectOpts {
+    custom_parameters: bool,
+}
+
+impl PgConnectOpts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_custom_parameters(mut self, enable: bool) -> Self {
+        self.custom_parameters = enable;
+        self
+    }
+}
+
 #[derive(Default)]
 struct SessionState {
+    custom_parameters_enabled: bool,
     search_path: Setting<SearchPath>,
+    custom_parameters: HashMap<String, Setting<String>>,
 }
 
 type PgSessionState = Mutex<SessionState>;
@@ -127,7 +146,14 @@ pub fn open_database_with_io(
 
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
-        let context = Arc::new(PgSessionState::default());
+        Self::connect_with_opts(db, PgConnectOpts::new())
+    }
+
+    pub fn connect_with_opts(db: &Arc<turso_core::Database>, opts: PgConnectOpts) -> Result<Self> {
+        let context = Arc::new(PgSessionState::new(SessionState {
+            custom_parameters_enabled: opts.custom_parameters,
+            ..SessionState::default()
+        }));
         let conn = db.connect_with_context(context)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
@@ -421,10 +447,55 @@ pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {
         .map(|search_path| search_path.setting.clone())
 }
 
+pub(crate) fn set_custom_parameter(
+    conn: &Connection,
+    name: &str,
+    value: Option<&str>,
+    scope: SettingScope,
+) -> Result<Value> {
+    let mut state = session_state(conn)?.lock().unwrap();
+    if !state.custom_parameters_enabled {
+        return Err(LimboError::InvalidArgument(
+            "custom configuration parameters are an experimental feature. \
+             Enable with --experimental-custom-parameters flag"
+                .to_string(),
+        ));
+    }
+    if !is_valid_custom_parameter_name(name) {
+        return Err(LimboError::InvalidArgument(format!(
+            "invalid configuration parameter name \"{name}\""
+        )));
+    }
+    state
+        .custom_parameters
+        .entry(name.to_ascii_lowercase())
+        .or_default()
+        .set(conn, value.map(str::to_owned), scope);
+    Ok(Value::build_text(value.unwrap_or_default().to_owned()))
+}
+
+pub(crate) fn custom_parameter(conn: &Connection, name: &str) -> Option<String> {
+    let state = conn.context::<PgSessionState>()?.lock().unwrap();
+    let setting = state.custom_parameters.get(&name.to_ascii_lowercase())?;
+    Some(setting.current(conn).cloned().unwrap_or_default())
+}
+
 fn session_state(conn: &Connection) -> Result<&PgSessionState> {
     conn.context::<PgSessionState>().ok_or_else(|| {
         LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
     })
+}
+
+fn is_valid_custom_parameter_name(name: &str) -> bool {
+    name.contains('.') && name.split('.').all(is_simple_identifier)
+}
+
+fn is_simple_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || !first.is_ascii())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii())
 }
 
 fn parse_search_path(value: &str) -> Result<Vec<String>> {

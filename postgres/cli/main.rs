@@ -44,7 +44,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso_core::{DatabaseOpts, LimboError, OpenFlags, Statement, Value};
-use turso_pg::Connection;
+use turso_pg::{Connection, PgConnectOpts};
 use turso_pg_server::TursoPgServer;
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,12 @@ struct Opts {
         help = "Start PostgreSQL wire protocol server at given address (e.g. 0.0.0.0:5432)"
     )]
     server: Option<String>,
+
+    #[clap(
+        long,
+        help = "Enable experimental custom configuration parameters, such as app.user_id, in set_config. In server mode, all clients share these values"
+    )]
+    experimental_custom_parameters: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +107,7 @@ fn open_database(
     vfs: Option<&String>,
     readonly: bool,
     enable_load_extension: bool,
+    connect_opts: PgConnectOpts,
 ) -> anyhow::Result<(Arc<dyn turso_core::IO>, Connection)> {
     let db_opts = DatabaseOpts::new()
         .with_views(true)
@@ -123,7 +130,7 @@ fn open_database(
     };
 
     let (io, db) = turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts)?;
-    let conn = Connection::connect(&db)?;
+    let conn = Connection::connect_with_opts(&db, connect_opts)?;
     Ok((io, conn))
 }
 
@@ -1020,6 +1027,7 @@ fn main() -> anyhow::Result<()> {
         opts.vfs.as_ref(),
         opts.readonly,
         opts.server.is_none(),
+        PgConnectOpts::new().with_custom_parameters(opts.experimental_custom_parameters),
     )?;
 
     let interrupt_count = Arc::new(AtomicUsize::new(0));

@@ -7,8 +7,15 @@ fn run_tursopg(input: &[u8]) -> Output {
 }
 
 fn run_tursopg_with_db(db_path: impl AsRef<std::ffi::OsStr>, input: &[u8]) -> Output {
+    run_tursopg_with_args([db_path.as_ref()], input)
+}
+
+fn run_tursopg_with_args<S: AsRef<std::ffi::OsStr>>(
+    args: impl IntoIterator<Item = S>,
+    input: &[u8],
+) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(db_path)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -937,6 +944,33 @@ fn copy_from_file_not_found_repl() {
         run_tursopg(b"CREATE TABLE t(id INT);\nCOPY t FROM '/nonexistent/path/data.tsv';\n");
     // Should fail with nonzero exit
     assert_ne!(output.status.code(), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// Experimental custom configuration parameters
+// ---------------------------------------------------------------------------
+
+#[test]
+fn custom_parameters_need_the_experimental_flag() {
+    let output = run_tursopg(b"SELECT set_config('app.user_id', '42', false);\n");
+    assert_eq!(output.status.code(), Some(1));
+    let out = stdout(&output);
+    assert!(
+        out.contains("Enable with --experimental-custom-parameters flag"),
+        "{out}"
+    );
+}
+
+#[test]
+fn experimental_flag_enables_custom_parameters() {
+    let output = run_tursopg_with_args(
+        [":memory:", "--experimental-custom-parameters"],
+        b"SELECT set_config('app.user_id', '42', false);\n\
+          SELECT current_setting('app.user_id') || '-read' AS user_id;\n",
+    );
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{out}");
+    assert!(out.contains("42-read"), "{out}");
 }
 
 // ---------------------------------------------------------------------------

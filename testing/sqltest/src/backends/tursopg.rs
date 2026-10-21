@@ -96,7 +96,8 @@ impl SqlBackend for TursopgBackend {
         cmd.arg(&db_path)
             .arg("--server")
             .arg("127.0.0.1:0")
-            .arg("-q");
+            .arg("-q")
+            .arg("--experimental-custom-parameters");
         if config.readonly {
             cmd.arg("--readonly");
         }

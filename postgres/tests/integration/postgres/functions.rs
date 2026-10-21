@@ -252,6 +252,98 @@ fn test_pg_current_setting_reports_default_without_session_state(db: TempDatabas
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_set_config_rejects_custom_parameters_by_default(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let error = conn
+        .execute("SELECT set_config('app.user_id', '42', false)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(
+            "custom configuration parameters are an experimental feature. \
+             Enable with --experimental-custom-parameters flag"
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('app.user_id', true)"),
+        ["NULL"]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_custom_parameters_belong_to_one_connection(db: TempDatabase) {
+    let conn = db.connect_postgres_with_custom_parameters();
+    let other = db.connect_postgres_with_custom_parameters();
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('app.user_id', '42', false)"),
+        ["42"]
+    );
+    assert_eq!(
+        query_text(&conn.clone(), "SELECT current_setting('app.user_id')"),
+        ["42"]
+    );
+    assert_eq!(
+        query_text(&other, "SELECT current_setting('app.user_id', true)"),
+        ["NULL"]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_local_custom_parameter_ends_with_its_statement_in_autocommit_mode(db: TempDatabase) {
+    let conn = db.connect_postgres_with_custom_parameters();
+    assert_eq!(
+        conn.prepare(
+            "SELECT set_config('app.user_id', '42', true), current_setting('app.user_id')"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![Value::build_text("42"), Value::build_text("42")]]
+    );
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('app.user_id')"),
+        [""]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_local_custom_parameter_ends_for_statements_prepared_before_the_transaction(
+    db: TempDatabase,
+) {
+    let conn = db.connect_postgres_with_custom_parameters();
+    let mut setter = conn
+        .prepare("SELECT set_config('app.user_id', '42', true)")
+        .unwrap();
+    let mut reader = conn
+        .prepare("SELECT current_setting('app.user_id', true)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    setter.run_ignore_rows().unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("42")]]
+    );
+    conn.execute("COMMIT").unwrap();
+    reader.reset().unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("")]]
+    );
+
+    conn.execute("BEGIN").unwrap();
+    setter.reset().unwrap();
+    setter.run_ignore_rows().unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    reader.reset().unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_local_search_path_ends_with_the_transaction(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE config_items (v INT)").unwrap();
