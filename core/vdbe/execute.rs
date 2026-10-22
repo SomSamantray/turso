@@ -569,7 +569,7 @@ fn integer_operands(state: &ProgramState, lhs: usize, rhs: usize) -> Option<(i64
 }
 
 pub fn op_divide(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -581,6 +581,9 @@ pub fn op_divide(
         state.registers[*dest].set_int(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
+    }
+    if zero_divisor_error(program, state, *lhs, *rhs) {
+        return Err(LimboError::DivisionByZero.into());
     }
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_divide)
 }
@@ -608,7 +611,7 @@ pub fn op_drop_index(
 }
 
 pub fn op_remainder(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -621,7 +624,20 @@ pub fn op_remainder(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    if zero_divisor_error(program, state, *lhs, *rhs) {
+        return Err(LimboError::DivisionByZero.into());
+    }
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_remainder)
+}
+
+fn zero_divisor_error(program: &Program, state: &ProgramState, lhs: usize, rhs: usize) -> bool {
+    program.connection.db.opts.errors_on_zero_divisor
+        && is_numeric_zero(state.registers[rhs].get_value())
+        && !matches!(state.registers[lhs].get_value(), Value::Null)
+}
+
+fn is_numeric_zero(v: &Value) -> bool {
+    Numeric::from_value(v).is_some_and(|n| !n.to_bool())
 }
 
 pub fn op_bit_and(
