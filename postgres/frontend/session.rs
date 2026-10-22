@@ -6,8 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::catalog::{self, PostgresDialect};
 use crate::functions::ConfigParameter;
+use crate::sql_functions::SqlFunctions;
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
+use turso_pg_parser::sql_function::is_create_function;
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
@@ -24,6 +26,7 @@ pub struct PgConnection {
 
 struct PgConnectionInner {
     conn: Arc<Connection>,
+    sql_functions: SqlFunctions,
 }
 
 #[derive(Default)]
@@ -76,8 +79,12 @@ impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
         let context = Arc::new(PgSessionState::default());
         let conn = db.connect_with_context(context)?;
+        let sql_functions = SqlFunctions::new(conn.clone());
         Ok(Self {
-            inner: Arc::new(PgConnectionInner { conn }),
+            inner: Arc::new(PgConnectionInner {
+                conn,
+                sql_functions,
+            }),
         })
     }
 
@@ -188,15 +195,23 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .clone();
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let (sql, parse_result) = match pg_conn.sql_functions.inline_calls(sql, &parse_result)? {
+        Some(sql) => {
+            let parse_result =
+                turso_pg_parser::parse(&sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+            (Cow::Owned(sql), parse_result)
+        }
+        None => (Cow::Borrowed(sql), parse_result),
+    };
     let (sql, parse_result) =
         match create_table_schema_from_search_path(pg_conn, &parse_result, &search_path)? {
             Some((location, schema)) => {
-                let sql = turso_pg_parser::qualify_create_table_name(sql, location, &schema);
+                let sql = turso_pg_parser::qualify_create_table_name(&sql, location, &schema);
                 let parse_result = turso_pg_parser::parse(&sql)
                     .map_err(|e| LimboError::ParseError(e.to_string()))?;
                 (Cow::Owned(sql), parse_result)
             }
-            None => (Cow::Borrowed(sql), parse_result),
+            None => (sql, parse_result),
         };
     let translator = PostgreSQLTranslator::new();
     let translated = translator
@@ -328,6 +343,10 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
         handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
+    }
+
+    if is_create_function(&parse_result) {
+        return pg_conn.sql_functions.create(sql).map(Some);
     }
 
     if is_refresh_matview(&parse_result) {
