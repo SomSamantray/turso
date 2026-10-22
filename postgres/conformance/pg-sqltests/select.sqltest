@@ -834,3 +834,13 @@ expect {
     6
     7
 }
+
+test with-clause-on-set-operation-and-values {
+    WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION SELECT 2 ORDER BY 1;
+    WITH c AS (SELECT 3 AS x) VALUES ((SELECT x FROM c));
+}
+expect {
+    1
+    2
+    3
+}
