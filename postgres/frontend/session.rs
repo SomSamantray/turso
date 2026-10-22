@@ -76,6 +76,10 @@ impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
         let context = Arc::new(PgSessionState::default());
         let conn = db.connect_with_context(context)?;
+        // PostgreSQL always enforces foreign keys. SQLite connections start
+        // with enforcement off, which would accept REFERENCES clauses and
+        // then silently ignore them.
+        conn.set_foreign_keys_enabled(true);
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
         })
