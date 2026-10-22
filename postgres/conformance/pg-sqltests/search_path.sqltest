@@ -178,6 +178,19 @@ expect {
     0
 }
 
+test create-index-without-name-checks-names-in-table-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_un;
+    DROP TABLE IF EXISTS sp_un.t;
+    CREATE TABLE sp_un.t (x int);
+    CREATE TABLE t_x_idx (y int);
+    SET search_path TO sp_un, public;
+    CREATE INDEX ON t (x);
+    CREATE INDEX ON t (x);
+    DROP INDEX sp_un.t_x_idx;
+    DROP INDEX sp_un.t_x_idx1;
+}
+expect {}
+
 test create-index-skips-missing-schema-in-search-path {
     CREATE TABLE t (x int);
     SET search_path TO sp_missing_ci, public;

@@ -4528,9 +4528,10 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
-/// Casts and CASE pass through the name of the expression they wrap, and only
-/// when that expression has no name are they named after the outermost target
-/// type or `case`, so `1::int::text` is named `text`.
+/// Casts, CASE, COLLATE and subscripts pass through the name of the
+/// expression they wrap, and a field selection is named after the field. Only
+/// when the wrapped expression has no name is a cast named after its outermost
+/// target type and a CASE `case`, so `1::int::text` is named `text`.
 fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
     expression_name(node).or_else(|| cast_or_case_name(node))
 }
@@ -4542,6 +4543,12 @@ fn expression_name(node: &pg_query::protobuf::Node) -> Option<String> {
         Some(Node::ColumnRef(col_ref)) => return last_string(&col_ref.fields),
         Some(Node::TypeCast(type_cast)) => return expression_name(type_cast.arg.as_deref()?),
         Some(Node::CaseExpr(case_expr)) => return expression_name(case_expr.defresult.as_deref()?),
+        Some(Node::CollateClause(collate)) => return expression_name(collate.arg.as_deref()?),
+        Some(Node::AIndirection(indirection)) => {
+            return last_string(&indirection.indirection)
+                .or_else(|| expression_name(indirection.arg.as_deref()?))
+        }
+        Some(Node::AArrayExpr(_)) => "array",
         Some(Node::CoalesceExpr(_)) => "coalesce",
         Some(Node::MinMaxExpr(min_max)) => {
             use pg_query::protobuf::MinMaxOp;
@@ -4583,6 +4590,8 @@ fn cast_or_case_name(node: &pg_query::protobuf::Node) -> Option<String> {
     match &node.node {
         Some(Node::TypeCast(type_cast)) => last_string(&type_cast.type_name.as_ref()?.names),
         Some(Node::CaseExpr(_)) => Some("case".to_string()),
+        Some(Node::CollateClause(collate)) => cast_or_case_name(collate.arg.as_deref()?),
+        Some(Node::AIndirection(indirection)) => cast_or_case_name(indirection.arg.as_deref()?),
         _ => None,
     }
 }
@@ -5247,6 +5256,107 @@ pub fn unqualified_create_table_name_location(parse_result: &ParseResult) -> Opt
         return None;
     }
     Some(relation.location as usize)
+}
+
+/// Give a CREATE INDEX statement without an index name the name PostgreSQL
+/// chooses: `<table>_<columns>_idx`, with a number after `idx` while
+/// `name_is_taken(table, name)` says some relation already has the name.
+/// Expressions are named like result columns, or `expr` when they have no
+/// such name, and a column named twice gets a number after its second use.
+pub fn name_unnamed_index<E>(
+    parse_result: &mut ParseResult,
+    mut name_is_taken: impl FnMut(&str, &str) -> Result<bool, E>,
+) -> Result<(), E> {
+    use pg_query::protobuf::node::Node;
+
+    let Some(Node::IndexStmt(index)) = parse_result
+        .protobuf
+        .stmts
+        .first_mut()
+        .and_then(|raw| raw.stmt.as_mut())
+        .and_then(|stmt| stmt.node.as_mut())
+    else {
+        return Ok(());
+    };
+    if !index.idxname.is_empty() {
+        return Ok(());
+    }
+    let Some(relation) = &index.relation else {
+        return Ok(());
+    };
+    let table = relation.relname.clone();
+
+    let mut column_names: Vec<String> = Vec::new();
+    for param in index
+        .index_params
+        .iter()
+        .chain(&index.index_including_params)
+    {
+        let Some(Node::IndexElem(elem)) = &param.node else {
+            continue;
+        };
+        let name = if elem.name.is_empty() {
+            elem.expr
+                .as_deref()
+                .and_then(derived_column_name)
+                .unwrap_or_else(|| "expr".to_string())
+        } else {
+            elem.name.clone()
+        };
+        let mut unique_name = name.clone();
+        let mut number = 0;
+        while column_names.contains(&unique_name) {
+            number += 1;
+            let suffix = number.to_string();
+            let prefix = char_boundary_prefix(&name, MAX_IDENTIFIER_BYTES - suffix.len());
+            unique_name = format!("{prefix}{suffix}");
+        }
+        column_names.push(unique_name);
+    }
+
+    let columns = column_names.join("_");
+    let mut name = make_object_name(&table, &columns, "idx");
+    let mut number = 0;
+    while name_is_taken(&table, &name)? {
+        number += 1;
+        name = make_object_name(&table, &columns, &format!("idx{number}"));
+    }
+    index.idxname = name;
+    Ok(())
+}
+
+/// PostgreSQL keeps only the first 63 bytes (NAMEDATALEN - 1) of an
+/// identifier.
+const MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// PostgreSQL's makeObjectName: `<table>_<columns>_<label>`, with the longer
+/// of the table and column parts shortened first until the name fits in
+/// [`MAX_IDENTIFIER_BYTES`], so the name can be referred to again.
+fn make_object_name(table: &str, columns: &str, label: &str) -> String {
+    let available = MAX_IDENTIFIER_BYTES - label.len() - 2;
+    let (mut table_len, mut columns_len) = (table.len(), columns.len());
+    while table_len + columns_len > available {
+        if table_len > columns_len {
+            table_len -= 1;
+        } else {
+            columns_len -= 1;
+        }
+    }
+    format!(
+        "{}_{}_{label}",
+        char_boundary_prefix(table, table_len),
+        char_boundary_prefix(columns, columns_len)
+    )
+}
+
+/// The longest prefix of `s` that has at most `max_len` bytes and does not
+/// split a character.
+fn char_boundary_prefix(s: &str, max_len: usize) -> &str {
+    let mut len = max_len.min(s.len());
+    while !s.is_char_boundary(len) {
+        len -= 1;
+    }
+    &s[..len]
 }
 
 /// Try to extract a SHOW statement from a PG parse result.

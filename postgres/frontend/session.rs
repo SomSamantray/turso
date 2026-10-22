@@ -9,10 +9,10 @@ use crate::functions::ConfigParameter;
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
-    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgSetStmt, PgShowStmt, PostgreSQLTranslator,
+    is_comment_on, is_refresh_matview, is_set_transaction, name_unnamed_index,
+    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
+    try_extract_show, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
+    PgDropSchemaStmt, PgSetStmt, PgShowStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -186,8 +186,11 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .unwrap()
         .search_path
         .clone();
-    let parse_result =
+    let mut parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    name_unnamed_index(&mut parse_result, |table, name| {
+        relation_name_is_taken(&pg_conn.conn, &search_path, table, name)
+    })?;
     let (sql, parse_result) =
         match create_table_schema_from_search_path(pg_conn, &parse_result, &search_path)? {
             Some((location, schema)) => {
@@ -243,6 +246,70 @@ fn create_table_schema_from_search_path(
         return Ok(None);
     }
     Ok(Some((location, schema)))
+}
+
+/// Whether the schema of table `table` already has a table, index, view or
+/// sequence named `name`, which makes PostgreSQL choose another name for a
+/// new index on the table. The table is looked up in the same order as core
+/// does: temp first, then the schemas of `search_path`, or main and the
+/// other schemas when `search_path` is not set. Main when no database has
+/// the table.
+fn relation_name_is_taken(
+    conn: &Arc<Connection>,
+    search_path: &Option<Vec<String>>,
+    table: &str,
+    name: &str,
+) -> Result<bool> {
+    let attached = conn.attached_database_names();
+    let schemas = match search_path {
+        Some(search_path) => search_path
+            .iter()
+            .filter_map(|schema| {
+                if schema.eq_ignore_ascii_case("public") {
+                    Some("main".to_string())
+                } else {
+                    attached.contains(schema).then(|| schema.clone())
+                }
+            })
+            .collect(),
+        None => std::iter::once("main".to_string())
+            .chain(attached.iter().cloned())
+            .collect::<Vec<_>>(),
+    };
+    let has_temp = conn
+        .list_all_databases()
+        .iter()
+        .any(|(_, database, _)| database == "temp");
+    let databases = has_temp
+        .then(|| "temp".to_string())
+        .into_iter()
+        .chain(schemas)
+        .chain(std::iter::once("main".to_string()));
+    let mut taken = false;
+    for database in databases {
+        let mut stmt = conn.prepare_internal(format!(
+            "SELECT \
+             EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
+                     WHERE type = 'table' AND name COLLATE NOCASE = ?1), \
+             EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
+                     WHERE type IN ('table', 'index', 'view') \
+                     AND name COLLATE NOCASE IN (?2, '{SEQUENCE_TABLE_PREFIX}' || ?2))"
+        ))?;
+        stmt.bind_at(
+            NonZero::new(1).unwrap(),
+            Value::build_text(table.to_string()),
+        )?;
+        stmt.bind_at(
+            NonZero::new(2).unwrap(),
+            Value::build_text(name.to_string()),
+        )?;
+        let row = &stmt.run_collect_rows()?[0];
+        taken = row[1] == Value::from_i64(1);
+        if row[0] == Value::from_i64(1) {
+            break;
+        }
+    }
+    Ok(taken)
 }
 
 /// The first schema of `search_path` that exists, which is what PostgreSQL's
