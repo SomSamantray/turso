@@ -608,6 +608,7 @@ fn update_pragma(
                 jump_if_null: false,
             });
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: 0,
                 description: "Early halt because auto vacuum mode is not enabled".to_string(),
                 on_error: None,
